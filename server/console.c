@@ -38,6 +38,8 @@
 #include "unicode.h"
 #include "wincon.h"
 #include "winternl.h"
+#include "esync.h"
+#include "fsync.h"
 
 struct screen_buffer;
 struct console_input_events;
@@ -77,6 +79,8 @@ static const struct object_ops console_input_ops =
     no_add_queue,                     /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_esync_fd */
+    NULL,                             /* get_fsync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     console_input_get_fd,             /* get_fd */
@@ -88,6 +92,7 @@ static const struct object_ops console_input_ops =
     NULL,                             /* unlink_name */
     no_open_file,                     /* open_file */
     no_kernel_obj_list,               /* get_kernel_obj_list */
+    no_alloc_handle,                  /* alloc_handle */
     no_close_handle,                  /* close_handle */
     console_input_destroy             /* destroy */
 };
@@ -95,6 +100,8 @@ static const struct object_ops console_input_ops =
 static void console_input_events_dump( struct object *obj, int verbose );
 static void console_input_events_destroy( struct object *obj );
 static int console_input_events_signaled( struct object *obj, struct wait_queue_entry *entry );
+static int console_input_events_get_esync_fd( struct object *obj, enum esync_type *type );
+static unsigned int console_input_events_get_fsync_idx( struct object *obj, enum fsync_type *type );
 
 struct console_input_events
 {
@@ -102,6 +109,8 @@ struct console_input_events
     int			  num_alloc;   /* number of allocated events */
     int 		  num_used;    /* number of actually used events */
     struct console_renderer_event*	events;
+    int                   esync_fd;    /* esync file descriptor (signalled when events present) */
+    unsigned int          fsync_idx;
 };
 
 static const struct object_ops console_input_events_ops =
@@ -112,6 +121,8 @@ static const struct object_ops console_input_events_ops =
     add_queue,                        /* add_queue */
     remove_queue,                     /* remove_queue */
     console_input_events_signaled,    /* signaled */
+    console_input_events_get_esync_fd,/* get_esync_fd */
+    console_input_events_get_fsync_idx, /* get_fsync_idx */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
     no_get_fd,                        /* get_fd */
@@ -123,6 +134,7 @@ static const struct object_ops console_input_events_ops =
     NULL,                             /* unlink_name */
     no_open_file,                     /* open_file */
     no_kernel_obj_list,               /* get_kernel_obj_list */
+    no_alloc_handle,                  /* alloc_handle */
     no_close_handle,                  /* close_handle */
     console_input_events_destroy      /* destroy */
 };
@@ -173,6 +185,8 @@ static const struct object_ops screen_buffer_ops =
     no_add_queue,                     /* add_queue */
     NULL,                             /* remove_queue */
     NULL,                             /* signaled */
+    NULL,                             /* get_esync_fd */
+    NULL,                             /* get_fsync_idx */
     NULL,                             /* satisfied */
     no_signal,                        /* signal */
     screen_buffer_get_fd,             /* get_fd */
@@ -184,6 +198,7 @@ static const struct object_ops screen_buffer_ops =
     NULL,                             /* unlink_name */
     no_open_file,                     /* open_file */
     no_kernel_obj_list,               /* get_kernel_obj_list */
+    no_alloc_handle,                  /* alloc_handle */
     no_close_handle,                  /* close_handle */
     screen_buffer_destroy             /* destroy */
 };
@@ -254,6 +269,20 @@ static int console_input_events_signaled( struct object *obj, struct wait_queue_
     return (evts->num_used != 0);
 }
 
+static int console_input_events_get_esync_fd( struct object *obj, enum esync_type *type )
+{
+    struct console_input_events *evts = (struct console_input_events *)obj;
+    *type = ESYNC_MANUAL_SERVER;
+    return evts->esync_fd;
+}
+
+static unsigned int console_input_events_get_fsync_idx( struct object *obj, enum fsync_type *type )
+{
+    struct console_input_events *evts = (struct console_input_events *)obj;
+    *type = FSYNC_MANUAL_SERVER;
+    return evts->fsync_idx;
+}
+
 /* add an event to the console's renderer events list */
 static void console_input_events_append( struct console_input* console,
 					 struct console_renderer_event* evt)
@@ -308,6 +337,12 @@ static void console_input_events_get( struct console_input_events* evts )
                  (evts->num_used - num) * sizeof(evts->events[0]) );
     }
     evts->num_used -= num;
+
+    if (do_fsync() && !evts->num_used)
+        fsync_clear( &evts->obj );
+
+    if (do_esync() && !evts->num_used)
+        esync_clear( evts->esync_fd );
 }
 
 static struct console_input_events *create_console_input_events(void)
@@ -317,6 +352,14 @@ static struct console_input_events *create_console_input_events(void)
     if (!(evt = alloc_object( &console_input_events_ops ))) return NULL;
     evt->num_alloc = evt->num_used = 0;
     evt->events = NULL;
+    evt->esync_fd = -1;
+
+    if (do_fsync())
+        evt->fsync_idx = fsync_alloc_shm( 0, 0 );
+
+    if (do_esync())
+        evt->esync_fd = esync_create_fd( 0, 0 );
+
     return evt;
 }
 
